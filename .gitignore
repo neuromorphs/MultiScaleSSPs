@@ -219,3 +219,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# local editable clone of vsa-gym-wrapper (installed via tool.uv.sources)
+vsa-gym-wrapper/

@@ -12,10 +12,21 @@
 
 ## Installation
 
-<!-- TODO: installation instructions -->
+This project uses [uv](https://docs.astral.sh/uv/) and depends on a local editable clone of
+[vsa-gym-wrapper](https://github.com/ctn-waterloo/vsa-gym-wrapper) (the `vsagym` package).
 
 ```bash
-pip install -e .
+git clone https://github.com/ctn-waterloo/vsa-gym-wrapper
+uv sync
+```
+
+This creates `.venv` with `multiscalessps` and `vsagym` both installed in editable mode.
+Run things with `uv run python ...` or activate the env with `source .venv/bin/activate`.
+
+Alternatively, with plain pip:
+
+```bash
+pip install -e ./vsa-gym-wrapper -e .
 ```
 
 ## Usage

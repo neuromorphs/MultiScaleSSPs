@@ -7,11 +7,18 @@ name = "multiscalessps"
 version = "0.1.0"
 description = "MultiScaleSSPs library"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "matplotlib>=3.7",
+    "vsagym",
+    "ipykernel",
+    "jax",
+    "optax",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+vsagym = { path = "vsa-gym-wrapper", editable = true }
