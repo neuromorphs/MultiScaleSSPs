@@ -12,15 +12,21 @@
 
 ## Installation
 
-<!-- TODO: installation instructions -->
+Requires Python >= 3.9.
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
 ## Usage
 
-<!-- TODO: usage examples -->
+- Visualize a room environment (layout, dense sample data, and sampling behavior) and save the artifacts to a directory:
+
+  ```bash
+  python scripts/visualize_room.py --out-dir .scratch/room
+  ```
 
 ## Members
 
