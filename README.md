@@ -18,12 +18,19 @@ This project uses [uv](https://docs.astral.sh/uv/) and depends on a local editab
 [vsa-gym-wrapper](https://github.com/ctn-waterloo/vsa-gym-wrapper) (the `vsagym` package).
 
 ```bash
+make setup
+```
+
+`make setup` clones `vsa-gym-wrapper` (only if it isn't already present) and then runs `uv sync`.
+This creates `.venv` with `multiscalessps` and `vsagym` both installed in editable mode.
+Run things with `uv run python ...` or activate the env with `source .venv/bin/activate`.
+
+If you prefer to do it by hand:
+
+```bash
 git clone https://github.com/ctn-waterloo/vsa-gym-wrapper
 uv sync
 ```
-
-This creates `.venv` with `multiscalessps` and `vsagym` both installed in editable mode.
-Run things with `uv run python ...` or activate the env with `source .venv/bin/activate`.
 
 Alternatively, with plain pip:
 
