@@ -333,7 +333,7 @@ def save_summary(room, positions, label_counts, scale_counts, label_kl, self_kl,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out-dir", type=Path, default=Path("artifacts/room"))
+    parser.add_argument("--out-dir", type=Path, default=Path(".scratch/room"))
     parser.add_argument("--n-samples", type=int, default=300)
     parser.add_argument("--n-per-label", type=int, default=150)
     parser.add_argument("--diff-noise-level", type=float, default=0.5)
