@@ -219,6 +219,23 @@ class RoomEnv:
         mask = (xx - ox) ** 2 + (yy - oy) ** 2 <= r ** 2
         return [((float(x), float(y)), obj.name) for x, y in zip(xx[mask], yy[mask])]
 
+    def label_probability_maps(self) -> Dict[str, np.ndarray]:
+        """Ground-truth spatial probability map per label, over the base grid.
+
+        Each map has shape ``grid_size``, is uniform over the cells occupied
+        by that label and zero elsewhere, and sums to 1 - a valid discrete
+        distribution suitable for comparisons like KL divergence (see
+        ``multiscalessps.metrics``). Built from the base rasterized grid, so
+        every cell carries equal area regardless of any per-object
+        ``density`` override used by ``dense_positions()``.
+        """
+        grid = self.grid
+        maps = {}
+        for label in np.unique(grid):
+            mask = grid == label
+            maps[str(label)] = mask.astype(float) / mask.sum()
+        return maps
+
     def _rasterize(self) -> np.ndarray:
         (xmin, xmax), (ymin, ymax) = self.bounds
         H, W = self.grid_size
