@@ -7,6 +7,7 @@ __pycache__/
 *.so
 
 # Mac-specific files
+**/.scratch
 **/.DS_Store
 
 # Distribution / packaging
