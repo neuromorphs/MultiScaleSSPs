@@ -12,7 +12,14 @@ Produces, in --out-dir:
     sampled_points_labels_vs_scale.png - the same rejection-sampled points, shown once
                                   colored by label and once colored by derived scale,
                                   side by side (shows which labels collapse into which scale)
-    summary.json              - counts, areas, and the label/scale policy in effect
+    label_probability_maps.png - per-label ground-truth spatial probability map (heatmap),
+                                  titled with its KL divergence from a uniform distribution
+    label_kl_divergence.png   - bar chart of the same per-label KL-from-uniform values
+    kl_noise_robustness.png  - sanity check: KL(true || corrupted) vs. corruption strength,
+                                  for two corruption types (uniform-noise mixing, Gaussian blur)
+    map_diff_uniform_noise.png - per label: true map, noise-mixed map, and their difference
+    map_diff_blur.png        - per label: true map, blurred map, and their difference
+    summary.json              - counts, areas, KL divergences, and the label/scale policy in effect
 
 Usage:
     python scripts/visualize_room.py --out-dir /path/to/output
@@ -31,6 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from multiscalessps.envs.room import DEFAULT_LENGTH_SCALES, make_default_room
+from multiscalessps.metrics import blur_map, kl_divergence, kl_from_uniform, mix_uniform_noise
 
 
 def save_layout_plot(room, out_dir: Path):
@@ -162,6 +170,115 @@ def save_labels_vs_scale_plot(room, out_dir: Path, n_per_label: int, seed: int):
     plt.close(fig)
 
 
+def save_probability_maps_plot(room, out_dir: Path):
+    """Heatmap of each label's ground-truth probability map, titled with its KL from uniform."""
+    label_maps = room.label_probability_maps()
+    kl = kl_from_uniform(label_maps)
+    labels = sorted(label_maps, key=lambda label: kl[label])
+
+    fig, axes = plt.subplots(1, len(labels), figsize=(4 * len(labels), 4))
+    axes = np.atleast_1d(axes)
+
+    (xmin, xmax), (ymin, ymax) = room.bounds
+    for ax, label in zip(axes, labels):
+        im = ax.imshow(label_maps[label], extent=(xmin, xmax, ymin, ymax), origin="upper", cmap="viridis")
+        ax.set_title(f"{label}\nKL-from-uniform = {kl[label]:.2f}")
+        ax.set_aspect("equal")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "label_probability_maps.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return kl
+
+
+def save_kl_bar_chart(kl, out_dir: Path):
+    labels = sorted(kl, key=lambda label: kl[label])
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.bar(labels, [kl[label] for label in labels], color="#3182bd")
+    ax.set_ylabel("KL(P_label || Uniform)")
+    ax.set_title("Spatial concentration per label")
+    fig.tight_layout()
+    fig.savefig(out_dir / "label_kl_divergence.png", dpi=150)
+    plt.close(fig)
+
+
+def save_noise_robustness_plot(room, out_dir: Path):
+    """Sanity-check the KL metric: self-KL should be ~0, and KL should rise
+    monotonically as each label's map is corrupted, under two corruption
+    types (uniform-noise mixing, Gaussian blur).
+    """
+    label_maps = room.label_probability_maps()
+    self_kl = {label: kl_divergence(p, p) for label, p in label_maps.items()}
+
+    noise_levels = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+    sigmas = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]
+    label_colors = {"room": "#9ecae1", "floor": "#6baed6", "wall": "#08306b", "donut": "#e6550d"}
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for label, p in label_maps.items():
+        noise_kl = [kl_divergence(p, mix_uniform_noise(p, a)) for a in noise_levels]
+        blur_kl = [kl_divergence(p, blur_map(p, s)) for s in sigmas]
+        color = label_colors.get(label)
+        axes[0].plot(noise_levels, noise_kl, marker="o", color=color, label=label)
+        axes[1].plot(sigmas, blur_kl, marker="o", color=color, label=label)
+
+    axes[0].set_xlabel("uniform noise level")
+    axes[0].set_ylabel("KL(true || corrupted)")
+    axes[0].set_title("Corruption: uniform noise mixing")
+    axes[1].set_xlabel("blur sigma (grid cells)")
+    axes[1].set_title("Corruption: Gaussian blur")
+    for ax in axes:
+        ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "kl_noise_robustness.png", dpi=150)
+    plt.close(fig)
+    return self_kl
+
+
+def save_map_diff_plot(room, out_dir: Path, corruption_name: str, corrupt_fn, param_label: str):
+    """For each label: true map, corrupted map, and (corrupted - true).
+
+    The diff panel is what the single KL number summarizes as a scalar: red
+    = probability mass the corruption added where it shouldn't be, blue =
+    mass it removed from where it should be. Each label gets its own
+    symmetric color scale, since donut's per-cell probabilities are much
+    larger than room's (fewer occupied cells sharing the same total mass).
+    """
+    label_maps = room.label_probability_maps()
+    labels = list(label_maps.keys())
+    (xmin, xmax), (ymin, ymax) = room.bounds
+    extent = (xmin, xmax, ymin, ymax)
+
+    fig, axes = plt.subplots(len(labels), 3, figsize=(9, 3 * len(labels)))
+    col_titles = ["true", f"corrupted ({param_label})", "corrupted - true"]
+    for row, label in enumerate(labels):
+        true_p = label_maps[label]
+        corrupted_p = corrupt_fn(true_p)
+        diff = corrupted_p - true_p
+        vmax = max(np.abs(diff).max(), 1e-12)
+
+        ax_true, ax_corrupt, ax_diff = axes[row]
+        ax_true.imshow(true_p, extent=extent, origin="upper", cmap="viridis")
+        ax_corrupt.imshow(corrupted_p, extent=extent, origin="upper", cmap="viridis")
+        im = ax_diff.imshow(diff, extent=extent, origin="upper", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        fig.colorbar(im, ax=ax_diff, fraction=0.046, pad=0.04)
+
+        ax_true.set_ylabel(label, fontsize=11)
+        for ax, title in zip((ax_true, ax_corrupt, ax_diff), col_titles):
+            if row == 0:
+                ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_aspect("equal")
+
+    fig.suptitle(f"Ground truth vs. {corruption_name}")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"map_diff_{corruption_name}.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def compute_label_areas(room, positions):
     """Area per label, accounting for per-object density overrides.
 
@@ -186,7 +303,7 @@ def compute_label_areas(room, positions):
     return areas, cell_area
 
 
-def save_summary(room, positions, label_counts, scale_counts, out_dir: Path):
+def save_summary(room, positions, label_counts, scale_counts, label_kl, self_kl, out_dir: Path):
     label_areas, cell_area = compute_label_areas(room, positions)
 
     summary = {
@@ -197,6 +314,8 @@ def save_summary(room, positions, label_counts, scale_counts, out_dir: Path):
         "length_scales": DEFAULT_LENGTH_SCALES,
         "label_counts": dict(label_counts),
         "label_areas": label_areas,
+        "label_kl_from_uniform": label_kl,
+        "label_self_kl_sanity_check": self_kl,
         "scale_counts": dict(scale_counts),
         "objects": [
             {
@@ -217,6 +336,8 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=Path("artifacts/room"))
     parser.add_argument("--n-samples", type=int, default=300)
     parser.add_argument("--n-per-label", type=int, default=150)
+    parser.add_argument("--diff-noise-level", type=float, default=0.5)
+    parser.add_argument("--diff-sigma", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -229,7 +350,20 @@ def main():
     save_dense_scatter_plot(room, positions, args.out_dir)
     save_sampling_plot(room, args.out_dir, args.n_samples, args.seed)
     save_labels_vs_scale_plot(room, args.out_dir, args.n_per_label, args.seed)
-    save_summary(room, positions, label_counts, scale_counts, args.out_dir)
+    label_kl = save_probability_maps_plot(room, args.out_dir)
+    save_kl_bar_chart(label_kl, args.out_dir)
+    self_kl = save_noise_robustness_plot(room, args.out_dir)
+    save_map_diff_plot(
+        room, args.out_dir, "uniform_noise",
+        lambda p: mix_uniform_noise(p, args.diff_noise_level),
+        f"noise_level={args.diff_noise_level}",
+    )
+    save_map_diff_plot(
+        room, args.out_dir, "blur",
+        lambda p: blur_map(p, args.diff_sigma),
+        f"sigma={args.diff_sigma}",
+    )
+    save_summary(room, positions, label_counts, scale_counts, label_kl, self_kl, args.out_dir)
 
     print(f"Saved visualizations and data to {args.out_dir}")
 
