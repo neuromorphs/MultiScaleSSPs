@@ -29,7 +29,7 @@ import numpy as np
 from multiscalessps.envs.room import make_default_room
 from multiscalessps.models.baseline import VSASpatialMemory
 
-DEFAULT_LENGTH_SCALES = [0.05, 0.1, 0.15]
+DEFAULT_LENGTH_SCALES = [0.05, 0.1, 0.15, 0.2]
 
 
 def fit_models(room, length_scales, ssp_dim, seed, normalize_by_class):
@@ -60,11 +60,12 @@ def save_class_maps_grid(room, models, length_scales, out_dir: Path, normalize_b
         row_maps = [gt_maps[label]] + [
             models[ls].class_probability_maps(room)[label] for ls in length_scales
         ]
-        vmax = max(m.max() for m in row_maps)
 
         for col, (m, title) in enumerate(zip(row_maps, col_titles)):
             ax = axes[row, col]
-            im = ax.imshow(m, extent=extent, origin="upper", cmap="viridis", vmin=0, vmax=vmax)
+            im = ax.imshow(
+                m, extent=extent, origin="upper", cmap="viridis", vmin=0, vmax=m.max()
+            )
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_aspect("equal")
@@ -72,11 +73,13 @@ def save_class_maps_grid(room, models, length_scales, out_dir: Path, normalize_b
                 ax.set_title(title, fontsize=10)
             if col == 0:
                 ax.set_ylabel(label, fontsize=11)
-            if col == n_cols - 1:
-                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     title_suffix = " (normalized per class)" if normalize_by_class else ""
-    fig.suptitle(f"Decoded class probability maps vs. length scale{title_suffix}")
+    fig.suptitle(
+        f"Decoded class probability maps vs. length scale{title_suffix}\n"
+        "(each panel's color scale is normalized to its own max)"
+    )
     fig.tight_layout()
     fig.savefig(out_dir / "class_maps_grid.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
