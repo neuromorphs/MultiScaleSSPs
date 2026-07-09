@@ -506,7 +506,8 @@ def train_house(model: HouseMap, room_pts, room_lbls, w_room,
     g = torch.Generator().manual_seed(seed)
     n_r, n_f = room_pts.shape[0], furn_pts.shape[0]
     hist = {"loss": [], "room_loss": [], "furn_loss": [],
-            "ls_room": [], "ls_furn": [], "temp_room": [], "temp_furn": []}
+            "ls_room": [], "ls_furn": [], "gain_room": [], "gain_furn": [],
+            "temp_room": [], "temp_furn": []}
     for _ in range(epochs):
         opt.zero_grad()
         mi_r = torch.randperm(n_r, generator=g)[:mem_batch] if mem_batch < n_r else torch.arange(n_r)
@@ -532,6 +533,8 @@ def train_house(model: HouseMap, room_pts, room_lbls, w_room,
         hist["furn_loss"].append(furn_loss.item())
         hist["ls_room"].append(model.ls_room.detach().cpu().numpy().copy())
         hist["ls_furn"].append(model.ls_furn.detach().cpu().numpy().copy())
+        hist["gain_room"].append(torch.exp(model.log_gain_room).detach().cpu().numpy().copy())
+        hist["gain_furn"].append(torch.exp(model.log_gain_furn).detach().cpu().numpy().copy())
         hist["temp_room"].append(model.temp_room.item())
         hist["temp_furn"].append(model.temp_furn.item())
     with torch.no_grad():
@@ -539,7 +542,74 @@ def train_house(model: HouseMap, room_pts, room_lbls, w_room,
                                     furn_room_lbls if model.hierarchical else None)
     hist["ls_room"] = np.array(hist["ls_room"])
     hist["ls_furn"] = np.array(hist["ls_furn"])
+    hist["gain_room"] = np.array(hist["gain_room"])
+    hist["gain_furn"] = np.array(hist["gain_furn"])
     return memory, hist
+
+
+def animate_kernel_evolution(hist, room_names, furn_names, out_path,
+                             r_max=2.0, n_r=200, fps=12, max_frames=150):
+    """GIF: training loss (left) next to each class's radial kernel profile
+    (right), replayed epoch by epoch. Each class's FHRR kernel is proxied by
+    its Gaussian envelope k_c(r) = gain_c * exp(-(r/ls_c)^2 / 2) -- curve
+    width tracks the learned lengthscale, curve height tracks the learned
+    gain, so the animation shows both being learned jointly.
+    """
+    import matplotlib.animation as animation
+
+    n_epochs = len(hist["loss"])
+    stride = max(1, n_epochs // max_frames)
+    frames = list(range(0, n_epochs, stride))
+    if frames[-1] != n_epochs - 1:
+        frames.append(n_epochs - 1)
+
+    r = np.linspace(-r_max, r_max, n_r)
+    room_cmap = plt.get_cmap("tab10")
+    furn_cmap = plt.get_cmap("tab20")
+
+    def kernel(ls, gain):
+        return gain[:, None] * np.exp(-0.5 * (r[None, :] / ls[:, None]) ** 2)
+
+    fig, (ax_loss, ax_kernel) = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    ax_loss.plot(hist["loss"], color="0.6", lw=1)
+    (marker,) = ax_loss.plot([0], [hist["loss"][0]], "o", color="crimson", zorder=5)
+    ax_loss.set_xlabel("epoch")
+    ax_loss.set_ylabel("loss")
+    ax_loss.set_title("training loss")
+
+    room_lines = [
+        ax_kernel.plot(r, np.zeros_like(r), color=room_cmap(i % 10), lw=2,
+                       label=f"room:{n}")[0]
+        for i, n in enumerate(room_names)
+    ]
+    furn_lines = [
+        ax_kernel.plot(r, np.zeros_like(r), color=furn_cmap(i % 20), lw=1.2, ls="--",
+                       label=f"furn:{n}")[0]
+        for i, n in enumerate(furn_names)
+    ]
+    ax_kernel.set_xlim(-r_max, r_max)
+    ax_kernel.set_ylim(0, 1.05 * max(hist["gain_room"].max(), hist["gain_furn"].max(), 1e-3))
+    ax_kernel.set_xlabel("distance from center r")
+    ax_kernel.set_ylabel(r"gain $\cdot$ exp(-(r/ls)^2 / 2)")
+    ax_kernel.set_title("class-weighted kernel profiles")
+    ax_kernel.legend(fontsize=6, ncol=2, loc="upper right")
+    fig.tight_layout()
+
+    def update(epoch):
+        marker.set_data([epoch], [hist["loss"][epoch]])
+        room_k = kernel(hist["ls_room"][epoch], hist["gain_room"][epoch])
+        for ln, y in zip(room_lines, room_k):
+            ln.set_ydata(y)
+        furn_k = kernel(hist["ls_furn"][epoch], hist["gain_furn"][epoch])
+        for ln, y in zip(furn_lines, furn_k):
+            ln.set_ydata(y)
+        ax_kernel.set_title(f"class-weighted kernel profiles (epoch {epoch})")
+        return [marker, *room_lines, *furn_lines]
+
+    anim = animation.FuncAnimation(fig, update, frames=frames, blit=False)
+    anim.save(out_path, writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
 
 
 # ======================================================================
@@ -900,6 +970,10 @@ def run(args):
     os.makedirs(args.outdir, exist_ok=True)
     ext = env.bounds[0] + env.bounds[1]
     extent = (env.bounds[0][0], env.bounds[0][1], env.bounds[1][0], env.bounds[1][1])
+
+    print("rendering Tier 3 flat kernel-evolution GIF ...")
+    animate_kernel_evolution(hist3f, room_names, furn_names,
+                             f"{args.outdir}/tier3_flat_kernel_evolution.gif")
 
     fig, ax = plt.subplots(figsize=(6, 6))
     env.render(ax=ax)
