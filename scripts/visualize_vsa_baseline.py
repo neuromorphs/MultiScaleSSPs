@@ -125,7 +125,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=Path(".scratch/vsa_baseline"))
     parser.add_argument("--length-scales", type=float, nargs="+", default=DEFAULT_LENGTH_SCALES)
-    parser.add_argument("--ssp-dim", type=int, default=4096)
+    parser.add_argument("--ssp-dim", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--normalize-by-class",

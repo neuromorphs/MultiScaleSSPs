@@ -169,3 +169,123 @@ class VSASpatialMemory:
         )
 
         return cls(ssp_space, sp_space).fit(xy, labels, normalize_by_class=normalize_by_class)
+
+
+class PerClassVSASpatialMemory:
+    """Like ``VSASpatialMemory``, but each class gets its own memory bundle
+    instead of one shared vector distinguished via SP/class binding.
+
+    Every class's positions are just summed (and unit-normalized) directly
+    into that class's own memory -- there is no binding step and no
+    ``sp_space``, since a memory's identity is which class it belongs to, not
+    something bound into a shared vector. Mirrors ``PerClassMemoryFHRRMap``
+    in ``examples/multi_scale_learning.ipynb``.
+
+    Parameters
+    ----------
+    ssp_space : SSPSpace
+        Encodes continuous (x, y) positions into SSP vectors. A single,
+        fixed length-scale is used for every point regardless of class.
+    names : sequence of str
+        The label vocabulary; determines column order everywhere.
+    """
+
+    def __init__(self, ssp_space: SSPSpace, names: Sequence[str]):
+        self.ssp_space = ssp_space
+        self.names = list(names)
+        self.name_to_idx = {name: i for i, name in enumerate(self.names)}
+        self.memories = np.zeros((len(self.names), ssp_space.ssp_dim))
+
+    def fit(self, points: np.ndarray, labels: Sequence[str]) -> "PerClassVSASpatialMemory":
+        """Encode and store labeled points, replacing any existing memories.
+
+        Parameters
+        ----------
+        points : np.ndarray
+            (N, 2) array of (x, y) positions.
+        labels : sequence of str
+            Length-N sequence of class names, each present in ``self.names``.
+        """
+        points = np.atleast_2d(points)
+        class_idx = np.array([self.name_to_idx[label] for label in labels])
+        pos_ssps = self.ssp_space.encode(points)
+
+        memories = np.zeros((len(self.names), self.ssp_space.ssp_dim))
+        for idx in range(len(self.names)):
+            class_sum = pos_ssps[class_idx == idx].sum(axis=0, keepdims=True)
+            memories[idx] = self.ssp_space.normalize(class_sum)
+        self.memories = memories
+        return self
+
+    def query(self, points: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """Return a (N, n_classes) array of class probabilities at each point.
+
+        Correlates each query point's encoding directly against every class's
+        own memory (no unbinding needed) and scores with a softmax, so each
+        row sums to 1. Column order follows ``self.names``.
+        """
+        points = np.atleast_2d(points)
+        pos_ssps = self.ssp_space.encode(points)
+
+        sims = (pos_ssps @ self.memories.T) / temperature
+        sims -= sims.max(axis=1, keepdims=True)
+        exp_sims = np.exp(sims)
+        return exp_sims / exp_sims.sum(axis=1, keepdims=True)
+
+    def predict(self, points: np.ndarray, temperature: float = 1.0):
+        """Return (predicted_label, class_probabilities) for each point."""
+        probs = self.query(points, temperature=temperature)
+        pred_idx = np.argmax(probs, axis=1)
+        labels = np.array(self.names)[pred_idx]
+        return labels, probs
+
+    def class_probability_maps(
+        self, room, temperature: float = 1.0, eps: float = 1e-12
+    ) -> Dict[str, np.ndarray]:
+        """Estimated per-label spatial probability map over ``room``'s base grid.
+
+        See ``VSASpatialMemory.class_probability_maps`` -- identical contract.
+        """
+        H, W = room.grid_size
+        coords = np.array([room.cell_to_coord(i, j) for i in range(H) for j in range(W)])
+        probs = self.query(coords, temperature=temperature)
+
+        maps = {}
+        for name, idx in self.name_to_idx.items():
+            m = probs[:, idx].reshape(H, W) + eps
+            maps[name] = m / m.sum()
+        return maps
+
+    def evaluate_kl(self, room, temperature: float = 1.0) -> Dict[str, float]:
+        """KL(estimated label map || ground-truth label map) for each shared label."""
+        est_maps = self.class_probability_maps(room, temperature=temperature)
+        gt_maps = room.label_probability_maps()
+        return {
+            label: kl_divergence(est_maps[label], gt_maps[label])
+            for label in gt_maps
+            if label in est_maps
+        }
+
+    @classmethod
+    def from_room(
+        cls,
+        room,
+        ssp_dim: int = 257,
+        length_scale: float = 0.3,
+        rng: Optional[Union[int, np.random.Generator]] = None,
+    ) -> "PerClassVSASpatialMemory":
+        """Build and fit a per-class baseline VSA memory directly from a RoomEnv's dense positions."""
+        rng = _get_rng(rng)
+        positions = room.dense_positions()
+        xy = np.array([p for p, _ in positions])
+        labels = [label for _, label in positions]
+
+        ssp_space = RandomSSPSpace(
+            domain_dim=2,
+            ssp_dim=ssp_dim,
+            domain_bounds=np.array(room.bounds),
+            length_scale=length_scale,
+            rng=rng,
+        )
+        label_names = sorted(set(labels))
+        return cls(ssp_space, names=label_names).fit(xy, labels)
