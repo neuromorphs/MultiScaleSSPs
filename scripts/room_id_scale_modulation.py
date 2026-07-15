@@ -270,6 +270,34 @@ def magnitude_score_object(V_hat, g_half):
     return np.sum(np.abs(g_half[None, :] * V_hat) ** 2, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Point-level pruning: which individual sample points dominate an object's
+# encoding (orthogonal to bin-level pruning above -- this axis prunes the
+# spatial samples that get averaged into V_hat[j], not the map's spectrum).
+# ---------------------------------------------------------------------------
+
+
+def point_contribution(V_hat_j, point_specs, w_bin):
+    """Real-domain alignment of each individual point's own half-spectrum
+    with the object's full aggregate V_hat_j, gain-weighted by the same
+    w_bin diagonal bin-pruning already uses (gain is a per-bin factor that
+    commutes with averaging over points, so this is exactly each point's
+    contribution to the room's actually-deployed, gained encoding).
+    point_specs: (K, n_bins) complex, one row per point (half_spectrum_of_points
+    output). Returns (K,) real -- high value = point reinforces the aggregate
+    direction strongly; removing it shrinks ||V_hat_j|| the most."""
+    return np.real(np.sum(w_bin[None, :] * point_specs.conj() * V_hat_j[None, :], axis=1))
+
+
+def rebuild_V_from_points(ssp_space, pts, mask):
+    """Rebuild an object's raw (ungained) half-spectrum from only the points
+    surviving `mask` -- guards against an empty mask (always keeps >=1 point)."""
+    if not mask.any():
+        mask = np.zeros(len(pts), dtype=bool)
+        mask[0] = True
+    return half_spectrum_of_points(ssp_space, pts[mask]).mean(axis=0)
+
+
 class RoomData:
     """Per-room constants + per-draw collapsed sim coefficients D.
 
@@ -624,6 +652,76 @@ def pruned_room_sims(rd, ids_hat, g, scale_idx, mask):
     return np.einsum("ogb,b->og", D_whole, mask.astype(np.float64))
 
 
+def room_point_prune_curves(rd, ssp_space, ids_hat, g, scale_idx, W, remove_fractions, keep_highest=True):
+    """Cheap cosine-vs-fraction-removed curve for point-level pruning: for
+    each object, rank its own sample points by point_contribution and remove
+    remove_fraction*K_j of them, rebuild that object's V_hat from the
+    survivors, then re-bundle the WHOLE room via the existing scale-grouped
+    compute_D/cos_maps -- no bin masking here, just a different V_hat fed
+    into the exact pipeline that already trained/evaluated the room's gains.
+
+    keep_highest=True (default): keep the highest-contribution points, drop
+    the rest -- the compression-efficient direction (mirrors magnitude_mask's
+    energy-maximizing argument: a few dominant points capture most of the
+    aggregate's signal, so this asks "how few points can the memory be built
+    from"). keep_highest=False: keep the lowest-contribution points instead,
+    dropping the dominant ones -- a redundancy/robustness probe ("does the
+    memory survive losing its most dominant individual points").
+    """
+    w_bin = bin_diag_weight(g, scale_idx, rd.G_hat.shape[1])
+    w_scale = jnp.asarray(np.concatenate([[1.0], np.asarray(g) ** 2]))
+    targets = jnp.asarray(rd.targets)
+    pts_by_obj = rd.point_draws[-1]
+    V_full = rd.V_hats[-1]
+
+    contributions = [point_contribution(V_full[j], half_spectrum_of_points(ssp_space, pts_by_obj[j]), w_bin)
+                     for j in range(len(pts_by_obj))]
+
+    remove_fractions = sorted(set(remove_fractions) | {0.0})
+    per_obj_masks = []
+    for contrib in contributions:
+        K = len(contrib)
+        k_primes = {f: max(1, K - int(round(f * K))) for f in remove_fractions}
+        obj_masks = ranking_curve(contrib, sorted(set(k_primes.values())),
+                                  descending=keep_highest, dc_index=None)
+        per_obj_masks.append({f: obj_masks[kp] for f, kp in k_primes.items()})
+    masks_by_frac = {f: [per_obj_masks[j][f] for j in range(len(pts_by_obj))] for f in remove_fractions}
+
+    cos_mean = []
+    for f in remove_fractions:
+        V_pruned = np.stack([rebuild_V_from_points(ssp_space, pts_by_obj[j], masks_by_frac[f][j])
+                             for j in range(len(pts_by_obj))])
+        D_f = jnp.asarray(compute_D(rd.G_hat, V_pruned, ids_hat, W))
+        cos_mean.append(float(cos_maps(D_f, w_scale, targets).mean()))
+
+    baseline_cos = cos_mean[remove_fractions.index(0.0)]
+    D_ref = jnp.asarray(compute_D(rd.G_hat, V_full, ids_hat, W))
+    ref_cos = float(cos_maps(D_ref, w_scale, targets).mean())
+    assert abs(baseline_cos - ref_cos) < 1e-6, (
+        f"remove_fraction=0 point-pruned cosine ({baseline_cos:.6f}) doesn't reproduce "
+        f"the unpruned baseline ({ref_cos:.6f}) -- rebuild_V_from_points bug")
+
+    return dict(remove_fractions=np.array(remove_fractions), cos_mean=np.array(cos_mean),
+                baseline_cos=baseline_cos, masks_by_fraction=masks_by_frac, contributions=contributions,
+                keep_highest=keep_highest)
+
+
+def pruned_point_room_sims(rd, ssp_space, ids_hat, g, scale_idx, W, masks_by_object):
+    """Actual per-object similarity maps for a room's map after point-level
+    pruning: rebuild each object's V_hat from its surviving points, then reuse
+    the existing scale-grouped compute_D/cos_maps (no bin masking involved --
+    the point-domain analog of pruned_room_sims). Returns (sims, cos) so it
+    drops straight into overlay_figure the same way eval_room's output does."""
+    pts_by_obj = rd.point_draws[-1]
+    V_pruned = np.stack([rebuild_V_from_points(ssp_space, pts_by_obj[j], masks_by_object[j])
+                         for j in range(len(pts_by_obj))])
+    D = jnp.asarray(compute_D(rd.G_hat, V_pruned, ids_hat, W))
+    w_scale = jnp.asarray(np.concatenate([[1.0], np.asarray(g) ** 2]))
+    sims = np.asarray(jnp.einsum("ogk,k->og", D, w_scale))
+    cos = np.asarray(cos_maps(D, w_scale, jnp.asarray(rd.targets)))
+    return sims, cos
+
+
 # ---------------------------------------------------------------------------
 # Explicit-path evaluation (verifies the collapsed-D factorization)
 # ---------------------------------------------------------------------------
@@ -691,6 +789,40 @@ def decode_room(ssp_space, g, scale_idx, rd, ids):
 
     V = np.stack([encode_mod(ssp_space, g_full, p).mean(axis=0)
                   for p in rd.point_draws[-1]])
+    M = ssp_space.bind(ids, V).sum(axis=0)
+    queries = ssp_space.bind(M[None], ssp_space.invert(ids))
+    decoded = np.empty((len(rd.items), 2))
+    nfev = 0
+    for i in range(len(rd.items)):
+        decoded[i], nf = direct_optim_decode(
+            queries[i], ssp_space, g_full, [(x0, x1), (y0, y1)], grid_pts, mod_grid)
+        nfev += nf
+    hits = np.array([MplPath(it.polygon).contains_point(p, radius=1e-9)
+                     for it, p in zip(rd.items, decoded)])
+    errs = np.array([np.linalg.norm(p - it.center)
+                     for it, p in zip(rd.items, decoded)])
+    return dict(l_eff=l_eff, n_pts=n_pts, grid_x=gx, grid_y=gy,
+                decoded=decoded, hits=hits, errs=errs, nfev=nfev)
+
+
+def decode_room_point_pruned(ssp_space, g, scale_idx, rd, ids, kept_masks_by_object):
+    """Like decode_room, but each object's V is built from only the points
+    surviving kept_masks_by_object[j] instead of the full point set --
+    everything else (grid sizing via kernel_bump_fwhm, mod_grid, bind/invert,
+    direct_optim_decode) is untouched, so this returns the same dict shape
+    decode_room does and slots into the same print_decode/decode_figure
+    reporting."""
+    g_full = full_gain_spectrum(g, scale_idx)
+    x0, x1, y0, y1 = rd.room.interior
+    l_eff = min(kernel_bump_fwhm(ssp_space, g_full, r_max=5.0), x1 - x0)
+    n_pts = pts_per_dim(x1 - x0, l_eff)
+    gx, gy = np.linspace(x0, x1, n_pts), np.linspace(y0, y1, n_pts)
+    X, Y = np.meshgrid(gx, gy)
+    grid_pts = np.column_stack([X.ravel(), Y.ravel()])
+    mod_grid = encode_mod(ssp_space, g_full, grid_pts).astype(np.float32)
+
+    V = np.stack([encode_mod(ssp_space, g_full, p[mask]).mean(axis=0)
+                  for p, mask in zip(rd.point_draws[-1], kept_masks_by_object)])
     M = ssp_space.bind(ids, V).sum(axis=0)
     queries = ssp_space.bind(M[None], ssp_space.invert(ids))
     decoded = np.empty((len(rd.items), 2))
@@ -887,7 +1019,7 @@ def prune_scale_breakdown_figure(rooms_data, curves_by_room, scale_idx, n_scales
             ax.set_yticks(range(n_scales))
             ax.set_ylabel("scale (coarse -> fine)")
     fig.suptitle(f"bins kept per scale across the D' sweep -- {key}")
-    fig.tight_layout(rect=[0, 0, 0.9, 0.95])
+    fig.tight_layout(rect=(0, 0, 0.9, 0.95))
     fig.colorbar(im, ax=axs, shrink=0.7, label="fraction of that scale's bins kept")
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -939,6 +1071,124 @@ def prune_json_payload(args, rooms_data, curves_by_room):
             gate_loss_histories=curves["gate_loss_histories"])
     prune_args = {k: v for k, v in vars(args).items() if k.startswith("prune")}
     return dict(args=prune_args, rooms=rooms)
+
+
+def point_prune_curve_figure(rooms_data, curves_by_room, path):
+    """Per room: retained cosine vs. fraction of each object's own points
+    removed -- the point-domain analog of prune_figure, one line per room (a
+    single method, no strategy/criterion split the way bin-level pruning
+    has). Axis wording adapts to keep_highest (recorded per-run in curves)."""
+    keep_highest = next(iter(curves_by_room.values()))["keep_highest"]
+    removed_desc = "lowest" if keep_highest else "highest"
+    fig, axs = plt.subplots(2, 3, figsize=(14, 7), sharey=True, facecolor="white")
+    by_rc = {(rd.room.row, rd.room.col): rd for rd in rooms_data}
+    for (r, c), rd in by_rc.items():
+        ax = axs[1 - r, c]
+        curves = curves_by_room[rd.room.name]
+        ax.plot(curves["remove_fractions"] * 100, curves["cos_mean"], "-o", ms=4, color="tab:blue")
+        ax.axhline(curves["baseline_cos"], color="0.3", lw=1.0, ls=":")
+        total_pts = sum(len(p) for p in rd.point_draws[-1])
+        ax.set_title(f"{rd.room.theme} ({len(rd.items)} items, {total_pts} pts)", fontsize=10)
+        ax.set_xlabel(f"% of points removed ({removed_desc}-contribution first)")
+        if c == 0:
+            ax.set_ylabel("retained cosine")
+    keep_desc = "keeping highest-contribution points" if keep_highest else "keeping lowest-contribution points"
+    fig.suptitle(f"point-level pruning: retained cosine vs. % sample points removed per object ({keep_desc})")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
+def point_prune_scatter_figure(rooms_data, curves_by_room, fraction, path):
+    """Per room: each object's sample points, colored by whether they survive
+    point-level pruning at `fraction` removed -- directly visualizes which
+    spatial points dominate each object's encoding."""
+    keep_highest = next(iter(curves_by_room.values()))["keep_highest"]
+    removed_desc = "lowest" if keep_highest else "highest"
+    fig, axs = plt.subplots(2, 3, figsize=(14, 9.5), facecolor="white")
+    by_rc = {(rd.room.row, rd.room.col): rd for rd in rooms_data}
+    for (r, c), rd in by_rc.items():
+        ax = axs[1 - r, c]
+        masks = curves_by_room[rd.room.name]["masks_by_fraction"][fraction]
+        total_pts, kept_pts = 0, 0
+        for j, it in enumerate(rd.items):
+            pts = rd.point_draws[-1][j]
+            mask = masks[j]
+            total_pts += len(pts)
+            kept_pts += int(mask.sum())
+            ax.plot(*pts[mask].T, ".", ms=2, color="tab:blue", alpha=0.6, zorder=2)
+            ax.plot(*pts[~mask].T, ".", ms=4, color="tab:red", alpha=0.85, zorder=3)
+            ax.add_patch(MplPolygon(it.polygon, closed=True, facecolor="none",
+                                    edgecolor="0.15", lw=0.8, zorder=4))
+        x0, x1, y0, y1 = rd.room.interior
+        ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        ax.set_aspect("equal")
+        ax.set_xticks([]); ax.set_yticks([])
+        pct_kept = 100.0 * kept_pts / total_pts
+        ax.set_title(f"{rd.room.theme} ({len(rd.items)} items) -- kept {kept_pts}/{total_pts} pts "
+                    f"({pct_kept:.0f}%)", fontsize=9)
+    fig.suptitle(f"point-level pruning: kept (blue) vs. removed {removed_desc}-contribution (red) points "
+                f"-- {int(round(fraction * 100))}% removed")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {path}")
+
+
+def print_point_prune_summary(rooms_data, curves_by_room):
+    fractions = curves_by_room[rooms_data[0].room.name]["remove_fractions"]
+    keep_highest = curves_by_room[rooms_data[0].room.name]["keep_highest"]
+    kept_desc = "highest" if keep_highest else "lowest"
+    print(f"\npoint-level pruning: retained cosine vs. % of each object's points removed "
+          f"(keeping {kept_desc}-contribution points)")
+    print(f"{'room':<10}" + "".join(f"{'-' + str(int(round(f * 100))) + '%':>8}" for f in fractions))
+    for rd in rooms_data:
+        cos_mean = curves_by_room[rd.room.name]["cos_mean"]
+        print(f"{rd.room.theme:<10}" + "".join(f"{c:>8.3f}" for c in cos_mean))
+
+
+def print_point_prune_counts(rooms_data, curves_by_room, fraction):
+    """Per-object point counts (K_j total -> kept/removed) at one removal
+    fraction -- the exact numbers point_prune_scatter_figure visualizes and
+    point_prune_curve_figure's per-room % axis abstracts away."""
+    pct = int(round(fraction * 100))
+    print(f"\npoint-level pruning: per-object point counts at {pct}% removed")
+    print(f"{'room':<10} {'object':<8} {'total pts':>9} {'kept':>7} {'removed':>8}")
+    room_total, room_kept = 0, 0
+    for rd in rooms_data:
+        masks = curves_by_room[rd.room.name]["masks_by_fraction"][fraction]
+        for j, it in enumerate(rd.items):
+            total = len(rd.point_draws[-1][j])
+            kept = int(masks[j].sum())
+            room_total += total
+            room_kept += kept
+            print(f"{rd.room.theme:<10} {j:<8} {total:>9} {kept:>7} {total - kept:>8}")
+    print(f"{'ALL':<10} {'':<8} {room_total:>9} {room_kept:>7} {room_total - room_kept:>8}")
+
+
+def save_prune_points_npz(rooms_data, curves_by_room, path):
+    save = {}
+    for rd in rooms_data:
+        curves = curves_by_room[rd.room.name]
+        theme = rd.room.theme
+        save[f"points_{theme}_remove_fractions"] = curves["remove_fractions"]
+        save[f"points_{theme}_cos_mean"] = curves["cos_mean"]
+        save[f"points_{theme}_keep_highest"] = curves["keep_highest"]
+    np.savez(path, **save)
+    print(f"wrote {path}")
+
+
+def prune_points_json_payload(args, rooms_data, curves_by_room):
+    rooms = {}
+    for rd in rooms_data:
+        curves = curves_by_room[rd.room.name]
+        rooms[rd.room.theme] = dict(
+            n_obj=len(rd.items), baseline_cos=curves["baseline_cos"],
+            remove_fractions=curves["remove_fractions"].tolist(),
+            cos_mean=curves["cos_mean"].tolist(), keep_highest=curves["keep_highest"])
+    pp_args = {k: v for k, v in vars(args).items() if k.startswith("prune_points")}
+    return dict(args=pp_args, rooms=rooms)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1281,23 @@ def main():
     ap.add_argument("--prune-scale-breakdown-strategy", type=str, nargs="+", default=["priority"],
                     help="which --prune curves key(s) to break down by scale; 'all' for every "
                          "computed key (same key names as --prune-map-strategy)")
+    ap.add_argument("--prune-points", action=argparse.BooleanOptionalAction, default=False,
+                    help="prune the SAMPLE POINTS that feed each object's encoding (orthogonal to "
+                         "bin-level --prune): rank points by their contribution to the pooled "
+                         "encoding and see whether the residual point set still encodes/decodes it "
+                         "(requires --prune)")
+    ap.add_argument("--prune-points-keep", choices=["high", "low"], default="high",
+                    help="'high' (default): keep the highest-contribution points, drop the rest -- "
+                         "the compression-efficient direction (how few dominant points suffice). "
+                         "'low': keep the lowest-contribution points instead, dropping the dominant "
+                         "ones -- a redundancy/robustness probe")
+    ap.add_argument("--prune-points-fractions", type=float, nargs="+",
+                    default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+                    help="fractions of each object's OWN points to remove (per --prune-points-keep's "
+                         "direction) for the cheap cosine sweep")
+    ap.add_argument("--prune-points-decode-fractions", type=float, nargs="+", default=[0.3, 0.5, 0.7],
+                    help="subset of removal fractions to also run full position decoding + the "
+                         "kept/removed point scatter on (each costs an L-BFGS-B solve per object)")
     args = ap.parse_args()
     if args.prune_seed is None:
         args.prune_seed = args.seed
@@ -1040,6 +1307,8 @@ def main():
         ap.error("--prune-scale-breakdown requires --prune")
     if args.prune_map and not args.prune:
         ap.error("--prune-map requires --prune")
+    if args.prune_points and not args.prune:
+        ap.error("--prune-points requires --prune")
 
     # per-parameterization reg defaults: the fixed-amplitude Gaussian needs no
     # L1 (2 params regularize themselves) and a milder coarse bias
@@ -1244,6 +1513,63 @@ def main():
                 prune_scale_breakdown_figure(
                     rooms_data, curves_by_room, scale_idx, ssp_space.n_scales, key,
                     out_path.with_name(out_path.stem + f"_prune_scale_{key}.png"))
+
+        if args.prune_points:
+            remove_fractions = sorted(set(args.prune_points_fractions)
+                                      | set(args.prune_points_decode_fractions) | {0.0})
+            keep_highest = args.prune_points_keep == "high"
+            print(f"\nrunning post-hoc point-level pruning sweep (keeping {args.prune_points_keep}"
+                  f"-contribution points, remove fractions={args.prune_points_fractions}, "
+                  f"decode at {args.prune_points_decode_fractions}) ...")
+            point_curves_by_room = {}
+            for ri, rd in enumerate(rooms_data):
+                point_curves_by_room[rd.room.name] = room_point_prune_curves(
+                    rd, ssp_space, ids_hat_by_room_prune[rd.room.name], gains_src[ri], scale_idx, W,
+                    remove_fractions, keep_highest=keep_highest)
+                print(f"  {rd.room.theme:<10} baseline cos "
+                      f"{point_curves_by_room[rd.room.name]['baseline_cos']:.3f}")
+            print_point_prune_summary(rooms_data, point_curves_by_room)
+            point_prune_curve_figure(rooms_data, point_curves_by_room,
+                                     out_path.with_name(out_path.stem + "_prune_points.png"))
+            save_prune_points_npz(rooms_data, point_curves_by_room,
+                                  out_path.with_name(out_path.stem + "_prune_points.npz"))
+            with open(out_path.with_name(out_path.stem + "_prune_points.json"), "w") as f:
+                json.dump(prune_points_json_payload(args, rooms_data, point_curves_by_room), f, indent=2)
+
+            ids_for_decode = ids_trained if use_trained_ids else ids_by_room
+            for frac in args.prune_points_decode_fractions:
+                pct_pp = int(round(frac * 100))
+                point_prune_scatter_figure(
+                    rooms_data, point_curves_by_room, frac,
+                    out_path.with_name(out_path.stem + f"_prune_points_scatter_p{pct_pp}.png"))
+                print_point_prune_counts(rooms_data, point_curves_by_room, frac)
+                removed_desc = "lowest" if keep_highest else "highest"
+                kept_desc = "highest" if keep_highest else "lowest"
+
+                sims_pp, cos_by_room_pp = [], {}
+                for ri, rd in enumerate(rooms_data):
+                    masks = point_curves_by_room[rd.room.name]["masks_by_fraction"][frac]
+                    sims, cos = pruned_point_room_sims(
+                        rd, ssp_space, ids_hat_by_room_prune[rd.room.name], gains_src[ri],
+                        scale_idx, W, masks)
+                    sims_pp.append(sims)
+                    cos_by_room_pp[rd.room.name] = cos
+                overlay_figure(env, rooms_data, sims_pp, cos_by_room_pp,
+                              f"pruned map (point-level, keeping {kept_desc}-contribution points) "
+                              f"-- {pct_pp}% of points removed",
+                              out_path.with_name(out_path.stem + f"_prune_points_map_p{pct_pp}.png"),
+                              args.grid_n)
+
+                dec_pp = {}
+                for ri, rd in enumerate(rooms_data):
+                    masks = point_curves_by_room[rd.room.name]["masks_by_fraction"][frac]
+                    dec_pp[rd.room.name] = decode_room_point_pruned(
+                        ssp_space, gains_src[ri], scale_idx, rd, ids_for_decode[rd.room.name], masks)
+                print_decode(f"point-pruned, {pct_pp}% of points removed", rooms_data, dec_pp)
+                decode_figure(env, rooms_data, dec_pp,
+                             f"decoded positions after removing {pct_pp}% of each object's "
+                             f"{removed_desc}-contribution points",
+                             out_path.with_name(out_path.stem + f"_prune_points_decode_p{pct_pp}.png"))
 
     # adaptive direct-optim position decoding, per-room grids from l_eff
     dec_l = {rd.room.name: decode_room(ssp_space, g, scale_idx, rd,
