@@ -7,12 +7,12 @@ controls the scale, density, and spatial distribution of its features --
 the six-room analog of the quadrant blob world of
 scripts/quadrant_scale_modulation.py:
 
-    bedroom   -- few large items, wall-anchored (bed + nightstands + dresser)
-    living    -- sparse medium/large, wall + open floor (sofa, table, TV)
-    dining    -- one central table with a ring of chairs (tight cluster)
+    bedroom   -- ONLY large items, wall-anchored (bed + wardrobe + dresser)
+    living    -- large anchors (sofa, table, TV) plus scattered small clutter
+    dining    -- four slightly-oversized chairs ringed around the center
     office    -- desks in a regular row, each with a chair (structured)
-    bathroom  -- few small/medium fixtures on walls (tub, toilet, cabinet)
-    storage   -- many small items scattered densely (clutter)
+    circle    -- one large disk (pure coarse content)
+    storage   -- many small items scattered densely (heavy clutter)
 
 Feature shapes are top-down silhouettes of real ModelNet10 meshes (z-up,
 verified visually): surface points are projected to the ground plane,
@@ -67,8 +67,9 @@ CATEGORY_SIZE = {
     "bed": (2.1, 0.1), "sofa": (2.05, 0.1), "bathtub": (1.7, 0.1),
     "desk": (1.5, 0.1), "table": (1.5, 0.15), "dresser": (1.3, 0.1),
     "toilet": (0.75, 0.04), "chair": (0.58, 0.05), "night_stand": (0.5, 0.05),
-    "monitor": (0.55, 0.05),
+    "monitor": (0.55, 0.05), "circle": (1.9, 0.05),
 }
+MESH_CATEGORIES = [c for c in CATEGORY_SIZE if c != "circle"]  # circle is synthetic
 N_INSTANCES = 4  # cached mesh instances per category
 
 
@@ -130,6 +131,13 @@ def extract_footprint(off_path, n_pts=20000, grid_n=160):
     return poly / ext.max()
 
 
+def _add_synthetic(footprints):
+    """Non-mesh footprints: unit-diameter circle (48-gon)."""
+    th = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+    footprints["circle"] = [np.column_stack([np.cos(th), np.sin(th)]) * 0.5]
+    return footprints
+
+
 def load_footprints(refresh=False):
     """{category: [poly, ...]} with polys normalized; cached across runs."""
     if FOOTPRINT_CACHE.exists() and not refresh:
@@ -138,10 +146,10 @@ def load_footprints(refresh=False):
         for key in z.files:
             cat, i = key.rsplit("__", 1)
             out.setdefault(cat, {})[int(i)] = z[key]
-        return {c: [v[i] for i in sorted(v)] for c, v in out.items()}
+        return _add_synthetic({c: [v[i] for i in sorted(v)] for c, v in out.items()})
     print("extracting ModelNet10 footprints (one-time, cached) ...")
     out = {}
-    for cat in CATEGORY_SIZE:
+    for cat in MESH_CATEGORIES:
         polys = []
         idx = 1
         while len(polys) < N_INSTANCES and idx < 40:
@@ -158,7 +166,7 @@ def load_footprints(refresh=False):
     np.savez(FOOTPRINT_CACHE, **{f"{c}__{i}": p for c, v in out.items()
                                  for i, p in enumerate(v)})
     print(f"cached footprints to {FOOTPRINT_CACHE}")
-    return out
+    return _add_synthetic(out)
 
 
 # ---------------------------------------------------------------------------
@@ -364,22 +372,12 @@ class Placer:
 
 
 def furnish_bedroom(pl, fp, room):
-    # headboard on a door-free wall so both nightstands have space
+    # large items ONLY -- the room's spatial content is purely coarse
     doors = wall_doors(room)
     free = "".join(w for w in "SNWE" if not doors[w]) or "SNWE"
-    bed = pl.on_wall(fp, "bed", room, walls=free, face_out=True, u_range=(0.25, 0.75))
-    if bed is not None:
-        # nightstands flank the headboard, against the same wall
-        d = np.array([np.cos(bed.angle), np.sin(bed.angle)])   # long-axis dir
-        n = np.array([-d[1], d[0]])                            # across the bed
-        ext = bed.polygon.max(0) - bed.polygon.min(0)
-        head = bed.center - d * 0.5 * max(ext) * 0.78
-        w = CATEGORY_SIZE["night_stand"][0]
-        across = float(np.abs(ext) @ np.abs(n))   # bed width across n (axis-aligned)
-        for side in (-1, 1):
-            pl.at(fp, "night_stand", room, head + n * side * (across / 2 + w / 1.6),
-                  bed.angle, jitter=0.04)
-    pl.on_wall(fp, "dresser", room)
+    pl.on_wall(fp, "bed", room, walls=free, face_out=True, u_range=(0.25, 0.75))
+    pl.on_wall(fp, "dresser", room, scale=1.8)   # wardrobe
+    pl.on_wall(fp, "dresser", room, scale=1.5)
 
 
 WALL_OF_ANGLE = {0.0: "S", np.pi: "N", -np.pi / 2: "W", np.pi / 2: "E"}
@@ -415,19 +413,23 @@ def furnish_living(pl, fp, room):
     pl.on_wall(fp, "dresser", room, scale=1.5)
     pl.on_wall(fp, "monitor", room, walls=tv_walls)
     pl.scatter(fp, "chair", room)
+    # small floor clutter (side tables / lamps / plants stand-ins) so the room
+    # mixes large anchors with fine detail
+    for cat in ("night_stand", "night_stand", "monitor", "chair"):
+        pl.scatter(fp, cat, room, scale=pl.size_of(cat) * pl.rng.uniform(0.7, 1.0),
+                   tries=60)
 
 
 def furnish_dining(pl, fp, room):
+    # four slightly-oversized chairs around the room center, no table
     c = room.center + pl.rng.uniform(-0.3, 0.3, 2)
-    table = pl.at(fp, "table", room, c, pl.rng.uniform(0, np.pi), jitter=0.05)
-    if table is None:
-        return
-    r_ring = table.scale / 2 + CATEGORY_SIZE["chair"][0] * 0.75
+    r_ring = 1.0
     th0 = pl.rng.uniform(0, 2 * np.pi)
-    for k in range(6):
-        th = th0 + k * np.pi / 3
-        pos = table.center + r_ring * np.array([np.cos(th), np.sin(th)])
-        pl.at(fp, "chair", room, pos, th + np.pi / 2, jitter=0.06)
+    for k in range(4):
+        th = th0 + k * np.pi / 2
+        pos = c + r_ring * np.array([np.cos(th), np.sin(th)])
+        pl.at(fp, "chair", room, pos, th + np.pi / 2,
+              scale=pl.size_of("chair") * 1.3, jitter=0.06)
 
 
 def furnish_office(pl, fp, room):
@@ -456,27 +458,33 @@ def furnish_office(pl, fp, room):
     pl.on_wall(fp, "dresser", room, walls=OPPOSITE_WALL[wall], scale=1.1)
 
 
-def furnish_bathroom(pl, fp, room):
-    pl.on_wall(fp, "bathtub", room, u_range=(0.12, 0.4))
-    pl.on_wall(fp, "toilet", room, face_out=True)
-    pl.on_wall(fp, "night_stand", room)   # cabinet
+def furnish_circle(pl, fp, room):
+    # a single large disk -- representable at very coarse resolution
+    x0, x1, y0, y1 = room.interior
+    scale = pl.size_of("circle")
+    m = scale / 2 + 0.3
+    spots = [tuple(room.center), (x0 + m, y0 + m), (x1 - m, y1 - m),
+             (x0 + m, y1 - m), (x1 - m, y0 + m)]
+    for pos in spots:
+        if pl.at(fp, "circle", room, pos, 0.0, scale=scale, jitter=0.15, tries=30):
+            break
 
 
 def furnish_storage(pl, fp, room):
     cats = ["chair", "night_stand", "monitor", "toilet", "chair", "night_stand"]
-    for k in range(15):
+    for k in range(26):
         cat = cats[k % len(cats)]
-        pl.scatter(fp, cat, room, scale=pl.size_of(cat) * pl.rng.uniform(0.8, 1.1),
-                   tries=40)
+        pl.scatter(fp, cat, room, scale=pl.size_of(cat) * pl.rng.uniform(0.6, 1.0),
+                   tries=60)
 
 
 THEMES = {
     "bedroom": furnish_bedroom, "living": furnish_living, "dining": furnish_dining,
-    "office": furnish_office, "bathroom": furnish_bathroom, "storage": furnish_storage,
+    "office": furnish_office, "circle": furnish_circle, "storage": furnish_storage,
 }
 # (row, col) -> theme; row 0 = bottom
 ROOM_LAYOUT = {
-    (1, 0): "bedroom", (1, 1): "living", (1, 2): "bathroom",
+    (1, 0): "bedroom", (1, 1): "living", (1, 2): "circle",
     (0, 0): "office", (0, 1): "dining", (0, 2): "storage",
 }
 
@@ -563,24 +571,21 @@ CATEGORY_COLOR = {
     "bed": "#8aa9c9", "sofa": "#9db98f", "bathtub": "#a3c4c9", "desk": "#c9b18a",
     "table": "#c9a98f", "dresser": "#b3a1c7", "toilet": "#c9c3a3",
     "chair": "#d0907f", "night_stand": "#c7a1b4", "monitor": "#8f8f9e",
+    "circle": "#7fb2c9",
 }
 THEME_TINT = {
     "bedroom": "#f6f1ea", "living": "#eef3ec", "dining": "#f5eeee",
-    "office": "#edf1f5", "bathroom": "#ecf4f5", "storage": "#f3f0ea",
+    "office": "#edf1f5", "circle": "#ecf4f5", "storage": "#f3f0ea",
 }
 
 
 def render_env(env, path, dpi=170):
+    """Clean top-down view: rooms, walls, doors, and furniture only."""
     fig, ax = plt.subplots(figsize=(13.2, 9.0), facecolor="white")
     for rm in env.rooms:
         x0, x1, y0, y1 = rm.bounds
         ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
                                facecolor=THEME_TINT[rm.theme], edgecolor="none", zorder=0))
-        n_items = sum(1 for it in env.items if it.room == rm.name)
-        ax.text(x0 + 0.18, y1 - 0.18, rm.theme.upper(), fontsize=11, color="0.45",
-                ha="left", va="top", fontweight="bold", zorder=5)
-        ax.text(x0 + 0.18, y1 - 0.52, f"{n_items} items", fontsize=8.5,
-                color="0.55", ha="left", va="top", zorder=5)
     for x, y, w, h in env.wall_rects:
         ax.add_patch(Rectangle((x, y), w, h, facecolor="0.15", edgecolor="none", zorder=4))
     for _, _, cx, cy, hor in env.doors:   # door leaf: thin open line
@@ -594,19 +599,12 @@ def render_env(env, path, dpi=170):
         ax.add_patch(MplPolygon(it.polygon, closed=True,
                                 facecolor=CATEGORY_COLOR[it.category],
                                 edgecolor="0.25", lw=0.7, zorder=2))
-    handles = [plt.Line2D([], [], marker="s", ls="none", ms=9,
-                          markerfacecolor=c, markeredgecolor="0.25", label=cat)
-               for cat, c in CATEGORY_COLOR.items()]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.02),
-              ncol=10, fontsize=9, frameon=False)
     ax.set_xlim(-0.25, WORLD_W + 0.25)
     ax.set_ylim(-0.25, WORLD_H + 0.25)
     ax.set_aspect("equal")
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
         s.set_visible(False)
-    ax.set_title("six-room indoor environment (2x3, ModelNet10 furniture footprints)",
-                 fontsize=13)
     fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -636,8 +634,8 @@ def export_env(env, path):
 def print_stats(env):
     print(f"\n{'room':<10} {'items':>5} {'mean size':>10} {'size range':>13}  distribution")
     style = {"bedroom": "wall-anchored", "living": "wall + open floor",
-             "dining": "central cluster", "office": "regular rows",
-             "bathroom": "wall fixtures", "storage": "dense scatter"}
+             "dining": "chair ring", "office": "regular rows",
+             "circle": "one large disk", "storage": "dense scatter"}
     for rm in env.rooms:
         its = [it for it in env.items if it.room == rm.name]
         if not its:
