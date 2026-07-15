@@ -229,6 +229,53 @@ def gains_from_raw(raw):
     return jax.nn.softplus(raw + SOFTPLUS_INV_1)
 
 
+def gain_param(args, n_sc):
+    """(gain_fn, init_row) for the chosen gain parameterization.
+
+    'free': one non-negative gain per scale (softplus, init 1).
+    'gaussian': the star_ssp_mean notebook's kernel -- gains are a discretized
+    1-D Gaussian over the scale-block index, only center mu and width sigma
+    are learned (peak amplitude fixed at 1); init centered and wide
+    (near-flat), sigma = softplus(raw) + 1e-3.
+    'window': a sliding boxcar of --window-width consecutive 1s (0 outside);
+    only its center is learned. Trained as a soft window (product of two
+    sigmoids, temperature 0.5, so the center gets gradients), snapped to the
+    hard binary window for evaluation and decoding.
+    """
+    if args.gain_param == "free":
+        return gains_from_raw, jnp.zeros(n_sc)
+    k = jnp.arange(n_sc)
+
+    if args.gain_param == "window":
+        half = args.window_width / 2.0
+
+        def window(p):
+            return (jax.nn.sigmoid((k - (p[0] - half)) / 0.5)
+                    * jax.nn.sigmoid(((p[0] + half) - k) / 0.5))
+
+        return window, jnp.array([(n_sc - 1) / 2.0])
+
+    def gauss(p):
+        sigma = jax.nn.softplus(p[1]) + 1e-3
+        return jnp.exp(-0.5 * ((k - p[0]) / sigma) ** 2)
+
+    return gauss, jnp.array([(n_sc - 1) / 2.0, 5.0])
+
+
+def snap_window(raw, n_sc, width):
+    """Hard binary windows (width consecutive 1s) nearest each soft center."""
+    starts = np.clip(np.round(np.asarray(raw)[:, 0] - (width - 1) / 2.0),
+                     0, n_sc - width).astype(int)
+    g = np.zeros((len(starts), n_sc))
+    for i, s in enumerate(starts):
+        g[i, s:s + width] = 1.0
+    return g
+
+
+def softplus_np(x):
+    return np.logaddexp(0.0, x)
+
+
 def cos_maps(D, w, targets):
     """Per-object cosine between sim maps D @ w and unit-norm targets."""
     sims = jnp.einsum("ogk,k->og", D, w)
@@ -246,7 +293,8 @@ def train(rooms_data, ssp_space, args, shared=False):
     fine scales cost proportionally more), both mild relative to the fit.
     """
     n_rooms, n_sc = len(rooms_data), ssp_space.n_scales
-    params = jnp.zeros((1 if shared else n_rooms, n_sc))
+    gain_fn, init = gain_param(args, n_sc)
+    params = jnp.tile(init[None], (1 if shared else n_rooms, 1))
     optimizer = optax.adam(args.lr)
     opt_state = optimizer.init(params)
     w_coarse = jnp.asarray(np.asarray(ssp_space.scales) / np.max(ssp_space.scales))
@@ -256,7 +304,7 @@ def train(rooms_data, ssp_space, args, shared=False):
     def loss_fn(params, draw):
         loss = 0.0
         for r in range(n_rooms):
-            g = gains_from_raw(params[0 if shared else r])
+            g = gain_fn(params[0 if shared else r])
             w = jnp.concatenate([jnp.ones(1), g ** 2])
             fit = 1.0 - cos_maps(D_all[r][draw], w, T_all[r]).mean()
             reg = (args.reg_w * jnp.sum(jnp.abs(g))
@@ -276,7 +324,8 @@ def train(rooms_data, ssp_space, args, shared=False):
         losses[i] = float(loss)
         if i % 200 == 0 or i == args.steps - 1:
             print(f"  step {i:>4}: loss {losses[i]:.4f}")
-    return np.asarray(gains_from_raw(params)), losses
+    gains = np.stack([np.asarray(gain_fn(p)) for p in params])
+    return gains, losses, np.asarray(params)
 
 
 def train_ids(rooms_data, ssp_space, scale_idx, args, shared=False):
@@ -297,7 +346,8 @@ def train_ids(rooms_data, ssp_space, scale_idx, args, shared=False):
          for rd in rooms_data]
     T = [jnp.asarray(rd.targets) for rd in rooms_data]
 
-    params = {"g": jnp.zeros((1 if shared else n_rooms, n_sc))}
+    gain_fn, init = gain_param(args, n_sc)
+    params = {"g": jnp.tile(init[None], (1 if shared else n_rooms, 1))}
     for r, rd in enumerate(rooms_data):   # init at the codebook IDs' phases
         params[f"ph{r}"] = jnp.asarray(np.angle(rd.ids_hat[:, 1:]), dtype=jnp.float32)
 
@@ -314,7 +364,7 @@ def train_ids(rooms_data, ssp_space, scale_idx, args, shared=False):
     def loss_fn(params, draw):
         loss = 0.0
         for r in range(n_rooms):
-            g = gains_from_raw(params["g"][0 if shared else r])
+            g = gain_fn(params["g"][0 if shared else r])
             fit = room_fit(g, params[f"ph{r}"], G[r], V[r][draw], T[r])
             reg = (args.reg_w * jnp.sum(jnp.abs(g))
                    + args.coarse_w * jnp.sum(w_coarse * g ** 2))
@@ -337,13 +387,13 @@ def train_ids(rooms_data, ssp_space, scale_idx, args, shared=False):
         if i % 200 == 0 or i == args.id_steps - 1:
             print(f"  step {i:>4}: loss {losses[i]:.4f}")
 
-    gains = np.asarray(gains_from_raw(params["g"]))
+    gains = np.stack([np.asarray(gain_fn(p)) for p in params["g"]])
     ids_by_room = {}
     for r, rd in enumerate(rooms_data):
         ph = np.asarray(params[f"ph{r}"])
         idh = np.exp(1j * np.concatenate([np.zeros((len(ph), 1)), ph], axis=1))
         ids_by_room[rd.room.name] = np.fft.irfft(idh, n=ssp_space.ssp_dim, axis=-1)
-    return gains, ids_by_room, losses
+    return gains, ids_by_room, losses, np.asarray(params["g"])
 
 
 # ---------------------------------------------------------------------------
@@ -583,18 +633,33 @@ def main():
     ap.add_argument("--n-draws", type=int, default=8, help="training point draws (one more for eval)")
     ap.add_argument("--grid-n", type=int, default=50, help="per-room grid resolution")
     ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--gain-param", choices=["free", "gaussian", "window"], default="free",
+                    help="'free': one gain per scale; 'gaussian': discretized "
+                         "Gaussian over scale blocks, learn only (mu, sigma); "
+                         "'window': boxcar of --window-width 1s, learn only its center")
+    ap.add_argument("--window-width", type=int, default=4,
+                    help="number of consecutive scales in the sliding window")
     ap.add_argument("--train-ids", action=argparse.BooleanOptionalAction, default=True,
                     help="jointly train unitary object IDs (Fourier phases) with the gains")
     ap.add_argument("--id-steps", type=int, default=1000, help="joint training steps")
     ap.add_argument("--lr", type=float, default=1e-2)
-    ap.add_argument("--reg-w", type=float, default=0.08,
-                    help="L1 sparsity penalty on the gains")
-    ap.add_argument("--coarse-w", type=float, default=0.06,
-                    help="scale-weighted penalty biasing toward coarse scales")
+    ap.add_argument("--reg-w", type=float, default=None,
+                    help="L1 sparsity penalty on the gains "
+                         "(default: 0.08 free / 0 gaussian)")
+    ap.add_argument("--coarse-w", type=float, default=None,
+                    help="scale-weighted penalty biasing toward coarse scales "
+                         "(default: 0.06 free / 0.03 gaussian)")
     ap.add_argument("--env-seed", type=int, default=7)
     ap.add_argument("--seed", type=int, default=3, help="IDs + point sampling")
     ap.add_argument("--out", type=str, default="results/indoor_env/room_id_modulation.png")
     args = ap.parse_args()
+
+    # per-parameterization reg defaults: the fixed-amplitude Gaussian needs no
+    # L1 (2 params regularize themselves) and a milder coarse bias
+    if args.reg_w is None:
+        args.reg_w = 0.08 if args.gain_param == "free" else 0.0
+    if args.coarse_w is None:
+        args.coarse_w = 0.06 if args.gain_param == "free" else 0.03
 
     out_path = FSPath(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,21 +706,41 @@ def main():
               f"(total {sum(rd.k_per_item)})")
     print(f"precomputed D coefficients in {time.time() - t0:.0f}s")
 
+    def report_params(raw, rds=None):
+        names = [rd.room.theme for rd in rds] if rds else ["shared"]
+        if args.gain_param == "gaussian":
+            print("  " + ", ".join(f"{n}: mu={p[0]:.2f} sig={softplus_np(p[1]) + 1e-3:.2f}"
+                                   for n, p in zip(names, raw)))
+        elif args.gain_param == "window":
+            print("  " + ", ".join(f"{n}: c={p[0]:.2f}" for n, p in zip(names, raw)))
+
     print("training per-room gains through the unbind-decode loss ...")
     t0 = time.time()
-    gains, _ = train(rooms_data, ssp_space, args)
+    gains, _, raw_l = train(rooms_data, ssp_space, args)
+    report_params(raw_l, rooms_data)
     print("training one shared gain profile for all rooms ...")
-    g_shared, _ = train(rooms_data, ssp_space, args, shared=True)
-    g_shared = g_shared[0]
+    g_shared_all, _, raw_s = train(rooms_data, ssp_space, args, shared=True)
+    g_shared = g_shared_all[0]
+    report_params(raw_s)
     gains_j, ids_trained = None, None
     if args.train_ids:
         print("jointly training gains + unitary IDs (Fourier phases) ...")
-        gains_j, ids_trained, _ = train_ids(rooms_data, ssp_space, scale_idx, args)
+        gains_j, ids_trained, _, raw_j = train_ids(rooms_data, ssp_space, scale_idx, args)
+        report_params(raw_j, rooms_data)
         print("jointly training ONE shared gain profile + unitary IDs ...")
-        gains_js, ids_trained_sh, _ = train_ids(rooms_data, ssp_space, scale_idx,
-                                                args, shared=True)
+        gains_js, ids_trained_sh, _, raw_js = train_ids(rooms_data, ssp_space, scale_idx,
+                                                        args, shared=True)
         g_shared_j = gains_js[0]
+        report_params(raw_js)
     print(f"trained in {time.time() - t0:.0f}s")
+
+    if args.gain_param == "window":   # snap soft training windows to hard 0/1
+        n_sc = ssp_space.n_scales
+        gains = snap_window(raw_l, n_sc, args.window_width)
+        g_shared = snap_window(raw_s, n_sc, args.window_width)[0]
+        if args.train_ids:
+            gains_j = snap_window(raw_j, n_sc, args.window_width)
+            g_shared_j = snap_window(raw_js, n_sc, args.window_width)[0]
 
     # held-out evaluation, explicit path (also verifies the factorization)
     g_ones = np.ones(ssp_space.n_scales)
@@ -729,6 +814,12 @@ def main():
     save = dict(gains=gains, gains_shared=g_shared,
                 scales=np.asarray(ssp_space.scales),
                 rooms=[rd.room.theme for rd in rooms_data])
+    if args.gain_param != "free":
+        save["param_raw"] = raw_l
+        save["param_raw_shared"] = raw_s
+        if args.train_ids:
+            save["param_raw_joint"] = raw_j
+            save["param_raw_shared_joint"] = raw_js
     if args.train_ids:
         save["gains_joint"] = gains_j
         save["gains_shared_joint"] = g_shared_j

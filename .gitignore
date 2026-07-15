@@ -232,5 +232,7 @@ __marimo__/
 # local editable clone of vsa-gym-wrapper (installed via tool.uv.sources)
 vsa-gym-wrapper/
 
-# Downloaded datasets (e.g. ModelNet10)
-data/
+# Downloaded datasets (e.g. ModelNet10), except the small cached footprints
+# needed to run the indoor env example without the meshes
+data/*
+!data/mn10_footprints.npz
