@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+*.png
+*.mp4
+*.gif
+*.json
+*.npz
+*.npy
+
+
 # C extensions
 *.so
 
@@ -223,3 +231,6 @@ __marimo__/
 
 # local editable clone of vsa-gym-wrapper (installed via tool.uv.sources)
 vsa-gym-wrapper/
+
+# Downloaded datasets (e.g. ModelNet10)
+data/
